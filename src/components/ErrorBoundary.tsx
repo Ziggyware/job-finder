@@ -25,10 +25,9 @@ export default class ErrorBoundary extends Component<{ children: ReactNode }, St
     if (!this.state.error) return this.props.children;
     return (
       <div className="mx-auto max-w-lg px-5 py-16 text-sm leading-relaxed">
-        <h1 className="text-lg font-semibold">Something broke while drawing the page.</h1>
-        <p className="mt-2 text-[var(--color-mute)]">
-          Reloading is safe. The run lives in this tab's memory, so reloading ends an active run; anything already
-          submitted was sent before the error and is not undone.
+        <h1 className="text-2xl font-semibold">Something broke while drawing the page.</h1>
+        <p className="mt-2 text-base text-[var(--color-mute)]">
+          Reload is safe. Your resume and tracker are saved in this browser.
         </p>
         <pre className="mono mt-3 overflow-auto rounded-lg border border-[var(--color-line)] bg-[var(--color-ink-2)] p-3 text-[11px] text-[#ffb4b4]">
           {this.state.error.message}

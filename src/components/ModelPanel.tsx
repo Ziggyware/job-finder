@@ -61,12 +61,9 @@ export function useEngineBridge() {
 
 export default function ModelPanel({ onClose }: { onClose: () => void }) {
   const engine = useStore((s) => s.engine);
-  const phase = useStore((s) => s.phase);
   const [cached, setCached] = useState<string[]>([]);
   const [showAll, setShowAll] = useState(false);
   const [busy, setBusy] = useState(false);
-  // Swapping or releasing the model under a live run would pull it out from under the agent.
-  const runActive = phase === 'running' || phase === 'paused';
 
   const [catalogue, setCatalogue] = useState<{ id: string; vram: number }[]>([]);
 
@@ -99,7 +96,7 @@ export default function ModelPanel({ onClose }: { onClose: () => void }) {
   }, [catalogue]);
 
   const load = async (id: string) => {
-    if (busy || runActive) return;
+    if (busy) return;
     setBusy(true);
     try {
       await ai.load(id);
@@ -172,7 +169,7 @@ export default function ModelPanel({ onClose }: { onClose: () => void }) {
                 {ai.host === 'web-worker' ? 'UI stays smooth while it thinks' : 'inference shares the main thread'}
               </div>
             </div>
-            <button className="btn" onClick={() => ai.unload()} disabled={runActive}>
+            <button className="btn" onClick={() => ai.unload()}>
               Release GPU memory
             </button>
           </div>
@@ -188,7 +185,7 @@ export default function ModelPanel({ onClose }: { onClose: () => void }) {
               sizeMB={m.sizeMB}
               cached={cached.includes(m.id)}
               active={engine.modelId === m.id}
-              busy={busy || runActive}
+              busy={busy}
               onLoad={() => load(m.id)}
             />
           ))}
@@ -204,7 +201,7 @@ export default function ModelPanel({ onClose }: { onClose: () => void }) {
               <button
                 key={m.id}
                 onClick={() => load(m.id)}
-                disabled={busy || runActive || engine.modelId === m.id}
+                disabled={busy || engine.modelId === m.id}
                 className={cx(
                   'flex w-full items-center justify-between gap-3 border-b border-[var(--color-line)] px-3 py-2 text-left text-xs last:border-b-0 hover:bg-[var(--color-panel-2)]',
                   engine.modelId === m.id && 'bg-[var(--color-panel-2)]',

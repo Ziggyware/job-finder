@@ -313,6 +313,72 @@ export async function summarizeProfile(ai: LocalAI | null, profile: ResumeProfil
   }
 }
 
+const FILL_KEY_LIST =
+  'firstName,middleName,lastName,fullName,email,phone,location,city,state,postal,country,street,linkedin,github,website,twitter,years,headline,currentTitle,currentCompany,school,degree,skills,summary,skip';
+
+/** Map free-text application labels onto fill keys. Sensitive labels become skip. */
+export async function classifyFieldLabels(
+  ai: LocalAI | null,
+  labels: string[],
+): Promise<Record<string, string>> {
+  const out: Record<string, string> = {};
+  for (const label of labels) {
+    if (sensitiveTopic(label)) out[label] = 'skip';
+  }
+  const unknown = labels.filter((l) => !out[l]);
+  if (!unknown.length || !ai?.ready) return out;
+  try {
+    const json = await ai.completeJSON<Record<string, string>>(
+      [
+        {
+          role: 'system',
+          content: `You map job-application field labels to one of: ${FILL_KEY_LIST}. Use skip when the field is login, password, salary, visa, EEO, or not answerable from a resume. JSON object only, keys = the labels exactly.`,
+        },
+        { role: 'user', content: unknown.slice(0, 24).map((l, i) => `${i + 1}. ${l}`).join('\n') },
+      ],
+      { maxTokens: 400, temperature: 0.1 },
+    );
+    if (json && typeof json === 'object') {
+      for (const [k, v] of Object.entries(json)) {
+        if (typeof v === 'string') out[k] = v;
+      }
+    }
+  } catch {
+    /* keep heuristic-only map */
+  }
+  return out;
+}
+
+/** Tighten the cover/summary on the fill payload using the local model. */
+export async function enhanceFillSummary(
+  ai: LocalAI | null,
+  profile: ResumeProfile,
+  jobTitle?: string,
+): Promise<string> {
+  const fallback = (profile.summary || '').replace(/\s+/g, ' ').trim();
+  if (!ai?.ready) return fallback;
+  try {
+    const text = await ai.complete(
+      [
+        {
+          role: 'system',
+          content:
+            'Write a 60-90 word first-person application summary from the brief only. No invented employers, metrics, or degrees. No greeting or sign-off.',
+        },
+        {
+          role: 'user',
+          content: `${profileBlock(profile)}${jobTitle ? `\nTarget role: ${jobTitle}` : ''}\nWrite the summary.`,
+        },
+      ],
+      { maxTokens: 220, temperature: 0.4 },
+    );
+    const cleaned = stripSignOff(text.trim());
+    return cleaned.length > 40 ? cleaned : fallback;
+  } catch {
+    return fallback;
+  }
+}
+
 /** Human ✓ / ✎ / ✕ decision on a drafted answer; the model never learns from it, it just gets applied. */
 export function applyHumanDecision(task: { suggestion?: string }, decision: 'accept' | string) {
   if (decision === 'accept') return task.suggestion ?? '';
