@@ -210,6 +210,15 @@ export default function BriefingStage() {
                 step={1}
                 onChange={(v) => setCriteria({ maxAgeDays: v })}
               />
+              <Slider
+                label="Wait for me up to (minutes, 0 = forever)"
+                value={Math.round(criteria.humanCheckTimeoutMs / 60000)}
+                min={0}
+                max={30}
+                step={1}
+                onChange={(v) => setCriteria({ humanCheckTimeoutMs: v * 60000 })}
+                hint="How long the pilot holds a checkpoint open before abandoning that application rather than guessing."
+              />
               <label className="flex items-center justify-between gap-3 text-xs">
                 <span className="text-[var(--color-mute)]">Remote-friendly postings only</span>
                 <Toggle value={criteria.remoteOnly} onChange={(v) => setCriteria({ remoteOnly: v })} />

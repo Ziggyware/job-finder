@@ -122,7 +122,7 @@ export class Pilot {
           this.st.resolvePending(taskId);
           this.log(
             'warn',
-            'No answer within the timeout — abandoning this one rather than guessing on your behalf. Raise the timeout in Settings if you need longer.',
+            'No answer within the wait window — abandoning this application rather than guessing on your behalf. Raise “wait for me” in the Briefing filters if you need longer.',
           );
           w.resolve({ value: '', decision: 'timeout' });
         }, timeout);
