@@ -2,12 +2,10 @@
   "name": "jobpilot",
   "version": "1.0.0",
   "scripts": {
-    "test": "jiti scripts/selftest.ts",
     "dev": "vite --host 0.0.0.0 --port 5173",
     "build": "vite build",
     "preview": "vite preview --host 0.0.0.0 --port 5173",
-    "typecheck": "tsc --noEmit",
-    "test:ui": "vite build --config vite.smoke.config.ts && node .smoke/uitest.mjs"
+    "typecheck": "tsc --noEmit"
   },
   "repository": {
     "type": "git",
