@@ -1,0 +1,188 @@
+@import 'tailwindcss';
+
+@theme {
+  --color-ink: #08090c;
+  --color-ink-2: #0c0e13;
+  --color-panel: #101319;
+  --color-panel-2: #151922;
+  --color-line: #222836;
+  --color-line-2: #2e3646;
+  --color-mute: #8b95a7;
+  --color-mute-2: #616c80;
+  --color-fg: #e7ecf3;
+  --color-pilot: #ffb020;
+  --color-pilot-dim: #7a5410;
+  --color-good: #34d399;
+  --color-bad: #f87171;
+  --color-info: #60a5fa;
+  --color-you: #c084fc;
+  --font-mono: ui-monospace, 'SF Mono', 'JetBrains Mono', Menlo, Consolas, monospace;
+}
+
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--color-line-2) transparent;
+}
+*::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+*::-webkit-scrollbar-thumb {
+  background: var(--color-line-2);
+  border-radius: 99px;
+  border: 3px solid transparent;
+  background-clip: content-box;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+body {
+  background:
+    radial-gradient(1100px 600px at 12% -8%, rgba(255, 176, 32, 0.07), transparent 60%),
+    radial-gradient(900px 500px at 100% 0%, rgba(96, 165, 250, 0.06), transparent 55%),
+    var(--color-ink);
+  color: var(--color-fg);
+  font-family: ui-sans-serif, system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+
+@layer utilities {
+  .panel {
+    background: linear-gradient(180deg, rgba(255, 255, 255, 0.02), transparent 40%), var(--color-panel);
+    border: 1px solid var(--color-line);
+    border-radius: 14px;
+  }
+  .panel-flat {
+    background: var(--color-ink-2);
+    border: 1px solid var(--color-line);
+    border-radius: 12px;
+  }
+  .hairline {
+    border-color: var(--color-line);
+  }
+  .btn {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 0.5rem;
+    border-radius: 10px;
+    border: 1px solid var(--color-line-2);
+    background: var(--color-panel-2);
+    color: var(--color-fg);
+    padding: 0.5rem 0.85rem;
+    font-size: 0.8125rem;
+    font-weight: 550;
+    line-height: 1.1;
+    transition: all 0.14s ease;
+    cursor: pointer;
+    white-space: nowrap;
+  }
+  .btn:hover:not(:disabled) {
+    border-color: #414c62;
+    background: #1d2330;
+    transform: translateY(-1px);
+  }
+  .btn:disabled {
+    opacity: 0.42;
+    cursor: not-allowed;
+  }
+  .btn-primary {
+    background: linear-gradient(180deg, #ffc24d, #f2a007);
+    border-color: #c98800;
+    color: #201400;
+    font-weight: 650;
+  }
+  .btn-primary:hover:not(:disabled) {
+    background: linear-gradient(180deg, #ffce6b, #ffae18);
+    border-color: #e0a000;
+  }
+  .btn-you {
+    background: linear-gradient(180deg, #cba2ff, #a855f7);
+    border-color: #8b3ff0;
+    color: #1a0b2e;
+    font-weight: 650;
+  }
+  .btn-ghost {
+    background: transparent;
+    border-color: transparent;
+  }
+  .btn-ghost:hover:not(:disabled) {
+    background: var(--color-panel-2);
+    border-color: var(--color-line);
+  }
+  .chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.3rem;
+    border: 1px solid var(--color-line-2);
+    background: var(--color-panel-2);
+    color: var(--color-mute);
+    border-radius: 999px;
+    padding: 0.15rem 0.5rem;
+    font-size: 0.6875rem;
+    font-weight: 550;
+    white-space: nowrap;
+  }
+  .card-hover {
+    transition: all 0.15s ease;
+  }
+  .card-hover:hover {
+    border-color: var(--color-line-2);
+    background: var(--color-panel-2);
+  }
+  .mono {
+    font-family: var(--font-mono);
+  }
+  .shine {
+    background-image: linear-gradient(100deg, transparent 20%, rgba(255, 255, 255, 0.14) 50%, transparent 80%);
+    background-size: 200% 100%;
+    animation: shine 1.4s linear infinite;
+  }
+  @keyframes shine {
+    from {
+      background-position: 200% 0;
+    }
+    to {
+      background-position: -200% 0;
+    }
+  }
+  .pulse-ring {
+    animation: pulsering 1.8s ease-out infinite;
+  }
+  @keyframes pulsering {
+    0% {
+      box-shadow: 0 0 0 0 rgba(192, 132, 252, 0.5);
+    }
+    100% {
+      box-shadow: 0 0 0 12px rgba(192, 132, 252, 0);
+    }
+  }
+  .fade-up {
+    animation: fadeup 0.28s ease both;
+  }
+  @keyframes fadeup {
+    from {
+      opacity: 0;
+      transform: translateY(4px);
+    }
+    to {
+      opacity: 1;
+      transform: none;
+    }
+  }
+  .caret::after {
+    content: '▍';
+    color: var(--color-pilot);
+    animation: blink 1s steps(2, start) infinite;
+    margin-left: 1px;
+  }
+  @keyframes blink {
+    to {
+      visibility: hidden;
+    }
+  }
+}
