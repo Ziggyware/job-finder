@@ -12,6 +12,7 @@
 import * as pdfjs from 'pdfjs-dist';
 import { unzipSync, strFromU8 } from 'fflate';
 import PdfWorker from 'pdfjs-dist/build/pdf.worker.min.mjs?worker';
+import { docxToText } from './docx';
 
 let workerReady = false;
 function ensurePdfWorker() {
@@ -48,33 +49,6 @@ function stripRtf(input: string): string {
     .trim();
 }
 
-/** Pull every <w:t> run out of a docx document part, inserting breaks at paragraphs. */
-function docxToText(xml: string): string {
-  const withBreaks = xml
-    .replace(/<w:br\b[^>]*\/?>/g, '\n')
-    .replace(/<\/w:p>/g, '\n')
-    .replace(/<w:tab\b[^>]*\/?>/g, '\t');
-  const runs = withBreaks.match(/<w:t[^>]*>[\s\S]*?<\/w:t>|<\/w:p>|\n|\t/g) ?? [];
-  let text = '';
-  for (const run of runs) {
-    if (run === '\n' || run === '\t') text += run;
-    else if (run.startsWith('<w:t')) {
-      const inner = run.replace(/^<w:t[^>]*>/, '').replace(/<\/w:t>$/, '');
-      text += decodeXml(inner);
-    }
-  }
-  return text.replace(/\n{3,}/g, '\n\n').trim();
-}
-
-function decodeXml(s: string): string {
-  return s
-    .replace(/&lt;/g, '<')
-    .replace(/&gt;/g, '>')
-    .replace(/&quot;/g, '"')
-    .replace(/&apos;/g, "'")
-    .replace(/&amp;/g, '&');
-}
-
 export async function extractResumeText(file: File): Promise<ExtractResult> {
   const warnings: string[] = [];
   const name = file.name.toLowerCase();
@@ -84,20 +58,27 @@ export async function extractResumeText(file: File): Promise<ExtractResult> {
   const looksPdf = name.endsWith('.pdf') || (buf[0] === 0x25 && buf[1] === 0x50);
   if (looksPdf) {
     ensurePdfWorker();
-    const doc = await pdfjs.getDocument({ data: buf }).promise;
+    const task = pdfjs.getDocument({ data: buf });
+    const doc = await task.promise;
+    const pages = doc.numPages;
     let text = '';
-    for (let p = 1; p <= doc.numPages; p++) {
-      const page = await doc.getPage(p);
-      const content = await page.getTextContent();
-      let lastY: number | null = null;
-      for (const item of content.items as any[]) {
-        if (typeof item.str !== 'string') continue;
-        const y = item.transform?.[5];
-        if (lastY !== null && y !== undefined && Math.abs(y - lastY) > 2) text += '\n';
-        text += item.str;
-        lastY = y ?? lastY;
+    try {
+      for (let p = 1; p <= pages; p++) {
+        const page = await doc.getPage(p);
+        const content = await page.getTextContent();
+        let lastY: number | null = null;
+        for (const item of content.items as any[]) {
+          if (typeof item.str !== 'string') continue;
+          const y = item.transform?.[5];
+          if (lastY !== null && y !== undefined && Math.abs(y - lastY) > 2) text += '\n';
+          text += item.str;
+          lastY = y ?? lastY;
+        }
+        text += '\n\n';
       }
-      text += '\n\n';
+    } finally {
+      // Release the parsed document; a long session would otherwise keep every resume in memory.
+      void task.destroy();
     }
     const cleaned = text.replace(/[ \t]{2,}/g, ' ').replace(/\n{3,}/g, '\n\n').trim();
     if (cleaned.length < 40) {
@@ -105,7 +86,7 @@ export async function extractResumeText(file: File): Promise<ExtractResult> {
         'This PDF had almost no selectable text — it may be a scan or an image export. Paste your resume text manually for best results.',
       );
     }
-    return { text: cleaned, kind: 'pdf', pages: doc.numPages, warnings };
+    return { text: cleaned, kind: 'pdf', pages, warnings };
   }
 
   // --- DOCX ------------------------------------------------------------

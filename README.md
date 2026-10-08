@@ -11,7 +11,7 @@ by line.
 ```bash
 npm install
 npm run dev      # http://localhost:5173
-npm test         # 37 logic checks: parser, matcher, threat model of the agent loop
+npm test         # 72 logic checks: parser, matcher, threat model of the agent loop
 npm run test:ui  # 36 UI checks in jsdom, driving the real app through the real widgets
 ```
 
@@ -74,10 +74,10 @@ posting's own screening question, clear the portals' anti-bot walls, click submi
 
 **The guard rails, which are the interesting part:**
 
-1. **It refuses to invent facts.** Work authorisation, notice period, salary expectations and credentials stop the run and
-   come to you. The prompt tells the model to answer `NEEDS_HUMAN` on those topics, *and* a keyword check re-catches them
-   afterwards, *and* a confidence floor (< 0.55) parks anything shaky. Any answer it drafts for a sensitive question is
-   shown to you for confirmation rather than submitted.
+1. **It refuses to invent facts.** Work authorisation, compensation expectations, notice period and availability,
+   credentials and clearances, equal-opportunity / self-identification questions, and criminal-record or background
+   questions are always handed to you. A shared sensitive-topic check runs *before* any heuristic or model, so no model
+   drafts an answer to these; the operator writes the answer. A confidence floor (< 0.55) parks anything else that is shaky.
 2. **It will not spray a doomed application.** Two postings in the exchange carry hard knockouts (a security clearance,
    shipped visionOS/Metal experience). The ATS simulation rejects those on parse; the pilot reports *why* and skips,
    instead of burning the application.
@@ -114,7 +114,7 @@ src/
   components/        ResumeStage → BriefingStage → RunStage + HumanPanel + AskPilot
   store.ts           zustand store; the pilot writes here, React reads it
 scripts/
-  selftest.ts        37 headless checks: parser, matcher, JSON repair, the whole
+  selftest.ts        72 headless checks: parser, matcher, JSON repair, the whole
                      pilot loop including pause/resume/stop, with a simulated operator
   uitest.tsx         36 checks driving the real app in jsdom through the real widgets
 ```
@@ -137,7 +137,7 @@ the expected string into the generated text CAPTCHA, clicking the correct tiles 
 sensitive-field textarea and clicking "Send to pilot". It then checks the board, the receipts, the audit log, the model
 panel, the Ask-the-pilot fallback, and pause/resume/stop.
 
-Both suites are green (37 + 36 checks). What they *cannot* cover is the real WebGPU path: model download, token
+Both suites are green (72 + 36 checks). What they *cannot* cover is the real WebGPU path: model download, token
 generation and refusal behaviour are exercised in a browser, not in Node.
 
 ---

@@ -61,9 +61,12 @@ export function useEngineBridge() {
 
 export default function ModelPanel({ onClose }: { onClose: () => void }) {
   const engine = useStore((s) => s.engine);
+  const phase = useStore((s) => s.phase);
   const [cached, setCached] = useState<string[]>([]);
   const [showAll, setShowAll] = useState(false);
   const [busy, setBusy] = useState(false);
+  // Swapping or releasing the model under a live run would pull it out from under the agent.
+  const runActive = phase === 'running' || phase === 'paused';
 
   const [catalogue, setCatalogue] = useState<{ id: string; vram: number }[]>([]);
 
@@ -96,6 +99,7 @@ export default function ModelPanel({ onClose }: { onClose: () => void }) {
   }, [catalogue]);
 
   const load = async (id: string) => {
+    if (busy || runActive) return;
     setBusy(true);
     try {
       await ai.load(id);
@@ -168,7 +172,7 @@ export default function ModelPanel({ onClose }: { onClose: () => void }) {
                 {ai.host === 'web-worker' ? 'UI stays smooth while it thinks' : 'inference shares the main thread'}
               </div>
             </div>
-            <button className="btn" onClick={() => ai.unload()}>
+            <button className="btn" onClick={() => ai.unload()} disabled={runActive}>
               Release GPU memory
             </button>
           </div>
@@ -184,7 +188,7 @@ export default function ModelPanel({ onClose }: { onClose: () => void }) {
               sizeMB={m.sizeMB}
               cached={cached.includes(m.id)}
               active={engine.modelId === m.id}
-              busy={busy}
+              busy={busy || runActive}
               onLoad={() => load(m.id)}
             />
           ))}
@@ -200,7 +204,7 @@ export default function ModelPanel({ onClose }: { onClose: () => void }) {
               <button
                 key={m.id}
                 onClick={() => load(m.id)}
-                disabled={busy}
+                disabled={busy || runActive || engine.modelId === m.id}
                 className={cx(
                   'flex w-full items-center justify-between gap-3 border-b border-[var(--color-line)] px-3 py-2 text-left text-xs last:border-b-0 hover:bg-[var(--color-panel-2)]',
                   engine.modelId === m.id && 'bg-[var(--color-panel-2)]',
@@ -258,6 +262,8 @@ function ModelRow({
   const engine = useStore((s) => s.engine);
   const isThis = engine.modelId === id;
   const downloading = isThis && (engine.state === 'downloading' || engine.state === 'loading');
+  // The loaded model is not reloadable from its own row, and a download in progress cannot be re-clicked.
+  const loadedAlready = active && engine.state === 'ready';
   return (
     <div
       className={cx(
@@ -275,7 +281,11 @@ function ModelRow({
           <p className="mt-1 text-[11px] leading-relaxed text-[var(--color-mute)]">{note}</p>
           <p className="mono mt-1 text-[10px] text-[var(--color-mute-2)]">~{sizeMB} MB download</p>
         </div>
-        <button className={cx('btn shrink-0', downloading && 'btn-primary')} onClick={onLoad} disabled={busy && !isThis}>
+        <button
+          className={cx('btn shrink-0', downloading && 'btn-primary')}
+          onClick={onLoad}
+          disabled={busy || downloading || loadedAlready}
+        >
           {downloading ? `${Math.round(engine.progress * 100)}%` : cached ? 'Load' : 'Download'}
         </button>
       </div>

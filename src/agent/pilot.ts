@@ -7,10 +7,11 @@ import type {
   LogEntry,
   PendingTask,
   ResumeProfile,
+  StepStatus,
 } from '../types';
 import type { LocalAI } from '../ai/engine';
 import { answerQuestion, draftCoverLetter, refineMatch } from '../ai/tasks';
-import { makePendingChallenge, nextChallenge, solveChallengeWithAI } from '../ai/humanCheck';
+import { answerMatches, makePendingChallenge, nextChallenge, solveChallengeWithAI } from '../ai/humanCheck';
 import { newId, useStore, type Criteria } from '../store';
 import { formFieldsFor, scoreJob, type FormField } from '../lib/match';
 import { confirmationId, sleep } from '../lib/util';
@@ -23,6 +24,13 @@ import { confirmationId, sleep } from '../lib/util';
 // questions and visual anti-bot walls — are first-class states, not error paths.
 // Nothing here pretends: when the local model cannot do something, the operator
 // is asked, and the log says so out loud.
+//
+// Lifecycle rules (these are what keep stop → start from running two loops):
+//   • Each run owns a loop promise. A new run waits for the previous loop to
+//     unwind before it resets any flags, so the old loop can never see the new
+//     run's state.
+//   • Stop settles every waiter, clears their timers, and clears pending items.
+//   • Every application and step leaves the run in a terminal state.
 // ---------------------------------------------------------------------------
 
 /** Thrown to unwind one application without killing the whole run. */
@@ -30,11 +38,27 @@ class SkipApplication extends Error {}
 /** Thrown when the operator hits stop. */
 class RunStopped extends Error {}
 
+interface HumanReply {
+  value: string;
+  decision: 'answer' | 'skip' | 'timeout';
+}
+
+interface Waiter {
+  resolve: (v: HumanReply) => void;
+  timer?: ReturnType<typeof setTimeout>;
+}
+
+const errText = (e: unknown) => (e as Error)?.message ?? String(e);
+
 export class Pilot {
   private paused = false;
   private stopped = false;
-  private waiters = new Map<string, { resolve: (v: HumanReply) => void }>();
+  private waiters = new Map<string, Waiter>();
   private running = false;
+  /** Identifies the run that currently owns the pilot. */
+  private token: object | null = null;
+  /** The loop promise of the current (or most recent) run. */
+  private loop: Promise<void> | null = null;
   private ai: LocalAI | null = null;
   /** 1 = watchable, 4 = hurry up. */
   speed = 1;
@@ -59,32 +83,35 @@ export class Pilot {
     await sleep(ms / this.speed);
   }
 
+  /** Hold while paused; unwind if stopped. Called at every step boundary. */
   private async checkpoint() {
     while (this.paused && !this.stopped) await sleep(120);
     if (this.stopped) throw new RunStopped();
   }
 
   pause() {
-    if (!this.running) return;
+    if (!this.running || this.paused || this.stopped) return;
     this.paused = true;
     this.st.setPhase('paused');
     this.log('warn', 'Run paused by operator. The pilot holds at the next checkpoint.');
   }
 
   resume() {
-    if (!this.running) return;
+    if (!this.running || !this.paused) return;
     this.paused = false;
     this.st.setPhase('running');
     this.log('info', 'Run resumed.');
   }
 
   stop() {
+    if (!this.running) return;
     this.stopped = true;
     this.paused = false;
-    this.ai?.interrupt();
-    for (const [, w] of this.waiters) w.resolve({ value: '', decision: 'skip' });
-    this.waiters.clear();
     this.running = false;
+    this.ai?.interrupt();
+    // Nothing waits on a human after a stop: settle every waiter, then clear the queue.
+    for (const id of [...this.waiters.keys()]) this.settle(id, { value: '', decision: 'skip' });
+    for (const p of [...this.st.pending]) this.st.resolvePending(p.id);
     this.st.setPhase('stopped');
     this.st.setActiveAppId(null);
     this.log('warn', 'Run stopped by operator. Applications already submitted stay submitted.');
@@ -93,38 +120,39 @@ export class Pilot {
   // --- human-in-the-loop plumbing -----------------------------------------
 
   answerPending(taskId: string, value: string) {
-    const w = this.waiters.get(taskId);
-    if (w) {
-      this.waiters.delete(taskId);
-      w.resolve({ value, decision: value ? 'answer' : 'skip' });
-    }
+    this.settle(taskId, { value, decision: value ? 'answer' : 'skip' });
     this.st.resolvePending(taskId);
   }
 
   skipPending(taskId: string) {
-    const w = this.waiters.get(taskId);
-    if (w) {
-      this.waiters.delete(taskId);
-      w.resolve({ value: '', decision: 'skip' });
-    }
+    this.settle(taskId, { value: '', decision: 'skip' });
     this.st.resolvePending(taskId);
+  }
+
+  /** Resolve a waiter exactly once, and cancel its timeout. */
+  private settle(taskId: string, reply: HumanReply): boolean {
+    const w = this.waiters.get(taskId);
+    if (!w) return false;
+    this.waiters.delete(taskId);
+    if (w.timer !== undefined) clearTimeout(w.timer);
+    w.resolve(reply);
+    return true;
   }
 
   private awaitHuman(taskId: string): Promise<HumanReply> {
     return new Promise<HumanReply>((resolve) => {
-      this.waiters.set(taskId, { resolve });
+      const waiter: Waiter = { resolve };
+      this.waiters.set(taskId, waiter);
       const timeout = this.st.criteria.humanCheckTimeoutMs;
       if (timeout > 0) {
-        setTimeout(() => {
-          const w = this.waiters.get(taskId);
-          if (!w) return;
-          this.waiters.delete(taskId);
-          this.st.resolvePending(taskId);
+        waiter.timer = setTimeout(() => {
+          if (this.waiters.get(taskId) !== waiter) return;
           this.log(
             'warn',
             'No answer within the wait window — abandoning this application rather than guessing on your behalf. Raise “wait for me” in the Briefing filters if you need longer.',
           );
-          w.resolve({ value: '', decision: 'timeout' });
+          this.settle(taskId, { value: '', decision: 'timeout' });
+          this.st.resolvePending(taskId);
         }, timeout);
       }
     });
@@ -189,17 +217,45 @@ export class Pilot {
 
   // --- main loop -----------------------------------------------------------
 
-  async run(ai: LocalAI | null, matches: JobMatch[], criteria: Criteria, profile: ResumeProfile) {
-    if (this.running) return;
+  /**
+   * Start a run. If one is already live this is a no-op that returns that run's
+   * promise. If a previous run is still unwinding after a stop, this waits for it
+   * to finish first, so two loops never work the same queue.
+   */
+  run(ai: LocalAI | null, matches: JobMatch[], criteria: Criteria, profile: ResumeProfile): Promise<void> {
+    if (this.running) return this.loop ?? Promise.resolve();
+
+    const prior = this.loop;
+    const token = {};
+    this.token = token;
     this.running = true;
-    this.paused = false;
-    this.stopped = false;
-    this.ai = ai;
 
+    this.loop = (async () => {
+      if (prior) await prior.catch(() => undefined);
+      // Only now is the previous loop guaranteed to be gone: reset this run's flags.
+      this.paused = false;
+      this.stopped = false;
+      this.ai = ai;
+      this.st.resetRun();
+      this.st.setPhase('running');
+      this.st.setActiveAppId(null);
+      try {
+        await this.body(ai, matches, criteria, profile);
+      } finally {
+        // Only the run that still owns the pilot may change its status.
+        if (this.token === token) {
+          this.running = false;
+          const phase = this.st.phase;
+          if (phase === 'running' || phase === 'paused') this.st.setPhase('finished');
+          this.st.setActiveAppId(null);
+        }
+      }
+    })();
+    return this.loop;
+  }
+
+  private async body(ai: LocalAI | null, matches: JobMatch[], criteria: Criteria, profile: ResumeProfile) {
     const st = this.st;
-    st.setPhase('running');
-    st.setActiveAppId(null);
-
     const queue = matches
       .filter((m) => m.score >= criteria.minScore)
       .sort((a, b) => b.score - a.score)
@@ -227,7 +283,11 @@ export class Pilot {
 
       for (let i = 0; i < queue.length; i++) {
         if (this.stopped) break;
-        const job = jobsById.get(queue[i].jobId)!;
+        const job = jobsById.get(queue[i].jobId);
+        if (!job) {
+          this.log('warn', `Skipping posting ${queue[i].jobId}: it is no longer in the job list.`);
+          continue;
+        }
         st.log('info', `── ${i + 1}/${queue.length} · ${job.title} @ ${job.company} ──`);
         try {
           await this.runOne(ai, profile, job, queue[i], criteria, i);
@@ -236,37 +296,75 @@ export class Pilot {
           if (e instanceof SkipApplication) {
             this.log('info', `Moving on. The ${job.company} application was left unsent on purpose.`);
           } else {
-            this.log('warn', `Application to ${job.company} failed: ${(e as Error)?.message ?? e}`);
-            st.patchApplication(st.activeAppId ?? '', { status: 'failed', error: (e as Error)?.message });
+            // runOne has already closed the application out as failed; this only reports it.
+            this.log('warn', `Application to ${job.company} failed: ${errText(e)}`);
           }
         }
-        const done = this.st;
-        done.setActiveAppId(null);
-        await this.wait(420);
+        this.st.setActiveAppId(null);
+        try {
+          await this.wait(420);
+        } catch (e) {
+          if (e instanceof RunStopped) break;
+          throw e;
+        }
       }
-
-      const s = this.st;
-      const submitted = s.applications.filter((a) => a.status === 'submitted').length;
-      const parked = s.applications.filter((a) => a.status === 'needs-you').length;
-      const failed = s.applications.filter((a) => a.status === 'failed').length;
-      if (this.stopped) {
-        // An operator stop is not a completion. Say what actually got sent.
-        s.log('warn', `Run stopped by operator — ${submitted} application(s) were already submitted and stay submitted.`);
-        s.setPhase('stopped');
-      } else {
-        s.log(
-          'good',
-          `Run complete — ${submitted} submitted · ${parked} waiting on you · ${failed} not sent. Full audit trail is in the log above.`,
-        );
-        s.setPhase('finished');
-      }
-      s.setActiveAppId(null);
     } catch (e) {
-      if (!(e instanceof RunStopped)) this.log('warn', `Pilot halted: ${(e as Error)?.message ?? e}`);
-    } finally {
-      this.running = false;
-      if (useStore.getState().phase === 'running' || useStore.getState().phase === 'paused')
-        useStore.getState().setPhase('finished');
+      if (!(e instanceof RunStopped)) this.log('warn', `Pilot halted: ${errText(e)}`);
+    }
+    this.summarise();
+  }
+
+  private summarise() {
+    const s = this.st;
+    const submitted = s.applications.filter((a) => a.status === 'submitted').length;
+    const parked = s.applications.filter((a) => a.status === 'needs-you').length;
+    const failed = s.applications.filter((a) => a.status === 'failed').length;
+    if (this.stopped) {
+      // An operator stop is not a completion. Say what actually got sent.
+      s.log('warn', `Run stopped by operator — ${submitted} application(s) were already submitted and stay submitted.`);
+      s.setPhase('stopped');
+    } else {
+      s.log(
+        'good',
+        `Run complete — ${submitted} submitted · ${parked} waiting on you · ${failed} not sent. Full audit trail is in the log above.`,
+      );
+      s.setPhase('finished');
+    }
+    s.setActiveAppId(null);
+  }
+
+  /**
+   * Close out an application whatever happened: every open step gets a terminal
+   * status, and the application itself ends submitted or failed. Stop and skip
+   * leave steps 'skipped'; an unexpected error leaves them 'failed'.
+   */
+  private closeOut(appId: string, outcome: unknown) {
+    const app = this.st.applications.find((a) => a.id === appId);
+    if (!app) return;
+    const stopped = outcome instanceof RunStopped;
+    const skipped = outcome instanceof SkipApplication;
+    const unexpected = outcome !== null && !stopped && !skipped;
+
+    for (const s of app.steps) {
+      if (s.status === 'pending' || s.status === 'running' || s.status === 'blocked') {
+        this.st.patchStep(appId, s.id, {
+          status: unexpected ? 'failed' : 'skipped',
+          detail: unexpected
+            ? 'Stopped by an unexpected error.'
+            : stopped
+              ? 'Run stopped before this step.'
+              : 'Application closed before this step.',
+        });
+      }
+    }
+
+    if (app.status !== 'submitted' && app.status !== 'failed') {
+      const error = unexpected
+        ? `Unexpected error: ${errText(outcome)}`
+        : stopped
+          ? 'Stopped by operator before submission.'
+          : 'Ended before submission.';
+      this.st.patchApplication(appId, { status: 'failed', error });
     }
   }
 
@@ -313,6 +411,48 @@ export class Pilot {
     st.addApplication(app);
     st.setActiveAppId(appId);
 
+    let outcome: unknown = null;
+    try {
+      await this.pursue(ai, profile, job, match, criteria, index, app, {
+        navStep,
+        analyzeStep,
+        matchStep,
+        fields,
+        fieldSteps,
+        checkStep,
+        submitStep,
+        confirmStep,
+      });
+    } catch (e) {
+      outcome = e;
+    } finally {
+      this.closeOut(appId, outcome);
+    }
+    if (outcome) throw outcome;
+  }
+
+  private async pursue(
+    ai: LocalAI | null,
+    profile: ResumeProfile,
+    job: Job,
+    match: JobMatch,
+    criteria: Criteria,
+    index: number,
+    app: Application,
+    s: {
+      navStep: ApplicationStep;
+      analyzeStep: ApplicationStep;
+      matchStep: ApplicationStep;
+      fields: FormField[];
+      fieldSteps: ApplicationStep[];
+      checkStep: ApplicationStep;
+      submitStep: ApplicationStep;
+      confirmStep: ApplicationStep;
+    },
+  ) {
+    const appId = app.id;
+    const { navStep, analyzeStep, matchStep, fields, fieldSteps, checkStep, submitStep, confirmStep } = s;
+
     const patch = (p: Partial<Application>) => this.st.patchApplication(appId, p);
     const patchStep = (id: string, p: Partial<ApplicationStep>) => this.st.patchStep(appId, id, p);
 
@@ -342,24 +482,30 @@ export class Pilot {
     // 2 — analyze ----------------------------------------------------------
     await run(analyzeStep, async () => {
       if (ai?.ready) {
-        await ai.complete(
-          [
+        try {
+          await ai.complete(
+            [
+              {
+                role: 'system',
+                content:
+                  'Extract the hard requirements of this posting as a comma-separated list, maximum 12 words total. No preamble, no bullets.',
+              },
+              {
+                role: 'user',
+                content: `Required: ${job.requiredSkills.join(', ')}. Nice to have: ${job.niceToHave.join(', ')}.`,
+              },
+            ],
             {
-              role: 'system',
-              content:
-                'Extract the hard requirements of this posting as a comma-separated list, maximum 12 words total. No preamble, no bullets.',
+              maxTokens: 50,
+              temperature: 0.1,
+              onToken: (partial) => patchStep(analyzeStep.id, { detail: partial.slice(-200) }),
             },
-            {
-              role: 'user',
-              content: `Required: ${job.requiredSkills.join(', ')}. Nice to have: ${job.niceToHave.join(', ')}.`,
-            },
-          ],
-          {
-            maxTokens: 50,
-            temperature: 0.1,
-            onToken: (partial) => patchStep(analyzeStep.id, { detail: partial.slice(-200) }),
-          },
-        );
+          );
+        } catch (e) {
+          // A model failure here is not a reason to drop the application: the posting's own list is authoritative.
+          if (e instanceof RunStopped) throw e;
+          this.log('warn', `The local model could not summarise the requirements (${errText(e)}). Using the posting's own list.`, appId);
+        }
       }
       this.log('ai', `Requirements parsed → required: ${job.requiredSkills.join(', ')}.`, appId);
       if (job.niceToHave.length)
@@ -377,12 +523,12 @@ export class Pilot {
         final = await refineMatch(ai, profile, job, match);
       }
       const known = scoreJob(profile, job);
-      final = { ...final, matchedSkills: known.matchedSkills, missingSkills: final.missingSkills.length ? final.missingSkills : known.missingSkills };
-      this.log(
-        final.verdict === 'strong' ? 'good' : 'info',
-        `Fit ${final.score}/100 (${final.verdict}). ${final.rationale}`,
-        appId,
-      );
+      final = {
+        ...final,
+        matchedSkills: known.matchedSkills,
+        missingSkills: final.missingSkills.length ? final.missingSkills : known.missingSkills,
+      };
+      this.log(final.verdict === 'strong' ? 'good' : 'info', `Fit ${final.score}/100 (${final.verdict}). ${final.rationale}`, appId);
       patch({ score: final.score, match: final });
       patchStep(matchStep.id, { detail: `${final.score}/100 · ${final.verdict}`, confidence: final.score / 100 });
     });
@@ -391,8 +537,7 @@ export class Pilot {
     if (final.score < 35) {
       this.log('warn', `Not submitting to ${job.company}: ${final.rationale}`, appId);
       patch({ status: 'failed', error: final.rationale });
-      for (const s of [fieldSteps, [checkStep, submitStep, confirmStep]].flat())
-        patchStep(s.id, { status: 'skipped' });
+      for (const st of [...fieldSteps, checkStep, submitStep, confirmStep]) patchStep(st.id, { status: 'skipped' });
       return;
     }
 
@@ -408,11 +553,7 @@ export class Pilot {
           detail: value.length > 160 ? `${value.slice(0, 160)}…` : value,
           confidence: field.id === 'cover_letter' ? 0.8 : 0.95,
         });
-        this.log(
-          'human',
-          `Filled “${field.label}” → ${value.length > 100 ? `${value.slice(0, 100)}…` : value}`,
-          appId,
-        );
+        this.log('human', `Filled “${field.label}” → ${value.length > 100 ? `${value.slice(0, 100)}…` : value}`, appId);
       });
     }
 
@@ -434,12 +575,15 @@ export class Pilot {
     const rounds = index % 3 === 0 ? 3 : index % 3 === 1 ? 1 : 2;
     for (let round = 0; round < rounds; round++) {
       await this.checkpoint();
-      const step = round === 0 ? checkStep : this.appendStep(app, {
-        id: newId('st'),
-        kind: 'human-check',
-        status: 'pending',
-        label: 'Portal anti-bot checkpoint (re-issued)',
-      });
+      const step =
+        round === 0
+          ? checkStep
+          : this.appendStep(app, {
+              id: newId('st'),
+              kind: 'human-check',
+              status: 'pending',
+              label: 'Portal anti-bot checkpoint (re-issued)',
+            });
       await this.runCheckpoint(ai, app, job, step, round);
     }
 
@@ -475,21 +619,34 @@ export class Pilot {
       }
     }
 
-    await run(submitStep, async () => {
-      this.log('info', `Clicking “Submit application” on the ${job.company} portal…`, appId);
-      await this.wait(880 + Math.random() * 500);
-    }, 'Submit clicked');
+    await run(
+      submitStep,
+      async () => {
+        this.log('info', `Clicking “Submit application” on the ${job.company} portal…`, appId);
+        await this.wait(880 + Math.random() * 500);
+      },
+      'Submit clicked',
+    );
 
     const receipt = confirmationId(job.company, job.title);
-    await run(confirmStep, async () => {
-      await this.wait(420);
-    }, `Receipt ${receipt}`);
+    await run(
+      confirmStep,
+      async () => {
+        await this.wait(420);
+      },
+      `Receipt ${receipt}`,
+    );
 
     patch({ status: 'submitted', confirmationId: receipt, coverLetter: filled.get('cover_letter') });
     this.log('good', `✅ Submitted to ${job.company} for “${job.title}” — confirmation ${receipt}.`, appId);
   }
 
-  /** One anti-bot wall: agent-solved, model-solved, or escalated to the human. */
+  /**
+   * One anti-bot wall. Agent-solved walls tick themselves. Language checks go to
+   * the local model; a wrong or missing answer is escalated as a plain question
+   * whose text never contains the expected answer. Visual walls are handed to the
+   * operator as-is, because a text-only model in a tab cannot see them.
+   */
   private async runCheckpoint(
     ai: LocalAI | null,
     app: Application,
@@ -512,21 +669,24 @@ export class Pilot {
       return;
     }
 
-    if (challenge.solvableBy === 'ai' && ai?.ready) {
+    if (challenge.solvableBy === 'ai') {
+      if (!ai?.ready) {
+        this.log('human', `Checkpoint: “${challenge.prompt}” is a language check, and no model is loaded to answer it.`, app.id);
+        await this.escalateCheckpoint(app, step, challenge.prompt, 'No local model loaded, so this check is left for you rather than guessed.');
+        return;
+      }
       this.log(
         'ai',
         `Checkpoint: “${challenge.prompt}” — a language puzzle, which is exactly what a small language model is good at.`,
         app.id,
       );
       const solved = await solveChallengeWithAI(
-        (p) => ai.complete([{ role: 'user', content: p }], { maxTokens: 10, temperature: 0 }).then((r) => r.trim()),
+        (p) => ai.complete([{ role: 'user', content: p }], { maxTokens: 10, temperature: 0 }),
         challenge,
       );
       await this.wait(700);
       const guess = solved?.answer ?? '';
-      const expected = (challenge.answer ?? '').toLowerCase();
-      const ok = !!guess && (expected.includes(guess) || guess.includes(expected));
-      if (ok) {
+      if (guess && answerMatches(guess, challenge.answer ?? '')) {
         patchStep({
           status: 'done',
           finishedAt: Date.now(),
@@ -537,22 +697,16 @@ export class Pilot {
         this.log('good', `Pilot answered “${guess}” — accepted first try. No human involved.`, app.id);
         return;
       }
-      this.log('warn', `Pilot's answer “${guess || '(nothing)'}” was rejected. Escalating to you.`, app.id);
-      challenge.kind = 'text-image';
-      challenge.solvableBy = 'human';
-      challenge.humanAnswer = (challenge.answer ?? 'motorcycle').toUpperCase().slice(0, 6);
-      challenge.prompt = `Type the characters in the image: ${challenge.humanAnswer}`;
+      this.log('warn', `Pilot's answer “${guess || '(nothing)'}” was not accepted. Escalating to you.`, app.id);
+      await this.escalateCheckpoint(app, step, challenge.prompt, "The local model's answer was not accepted, so this check is yours.");
+      return;
     }
 
-    // Honest hand-off: we cannot see images from a text model in a tab.
+    // Visual wall: honest hand-off. We cannot see images from a text model in a tab.
     const pending = makePendingChallenge(app.id, job.id, job.title, job.company, step.id, challenge);
     this.st.addPending(pending);
     this.st.patchApplication(app.id, { status: 'needs-you' });
-    patchStep({
-      status: 'blocked',
-      detail: challenge.prompt,
-      questionId: pending.id,
-    });
+    patchStep({ status: 'blocked', detail: challenge.prompt, questionId: pending.id });
     const shape =
       challenge.kind === 'text-image'
         ? 'a distorted-text image'
@@ -588,6 +742,13 @@ export class Pilot {
     await this.wait(420);
   }
 
+  /** A language check the model could not settle: the operator answers it as a plain question. */
+  private async escalateCheckpoint(app: Application, step: ApplicationStep, prompt: string, reason: string) {
+    await this.escalate(app, step, prompt, reason);
+    this.log('good', 'Checkpoint cleared by you. Resuming the application.', app.id);
+    await this.wait(420);
+  }
+
   private appendStep(app: Application, step: ApplicationStep): ApplicationStep {
     const current = this.st.applications.find((a) => a.id === app.id);
     this.st.patchApplication(app.id, { steps: [...(current?.steps ?? app.steps), step] });
@@ -605,7 +766,6 @@ export class Pilot {
     step: ApplicationStep,
   ): Promise<string> {
     await this.wait(220 + Math.random() * 260);
-    const patchStep = (p: Partial<ApplicationStep>) => this.st.patchStep(app.id, step.id, p);
 
     switch (field.id) {
       case 'full_name':
@@ -623,29 +783,22 @@ export class Pilot {
       case 'resume_file':
         return `resume.pdf — ${profile.name.replace(/\s+/g, '_')}.pdf (sent from this device)`;
       case 'work_auth':
-        return this.escalate(
-          app,
-          step,
-          field.label,
-          'Work authorisation is a legal declaration, not a resume line. The pilot will not infer it.',
-        );
+        return this.escalate(app, step, field.label, 'Work authorisation is a legal declaration, not a resume line. The pilot will not infer it.');
       case 'notice':
         return this.escalate(app, step, field.label, 'Only you know your real notice period.');
       case 'salary':
         return this.escalate(app, step, field.label, 'A negotiating position is not a fact on your resume.');
       case 'cover_letter': {
         const matched = scoreJob(profile, job).matchedSkills;
+        const text = await draftCoverLetter(ai?.ready ? ai : null, profile, job, matched);
         if (ai?.ready) {
-          const text = await draftCoverLetter(ai, profile, job, matched);
-          // Type it out so the operator can watch the model work.
+          // Type it out so the operator can watch the model work. Each character is a
+          // checkpoint, so pausing freezes the typing too.
           for (let i = 10; i <= text.length; i += 10) {
-            patchStep({ detail: text.slice(0, i) });
-            await sleep(22 / this.speed);
+            this.st.patchStep(app.id, step.id, { detail: text.slice(0, i) });
+            await this.wait(22);
           }
-          this.st.patchApplication(app.id, { coverLetter: text });
-          return text;
         }
-        const text = await draftCoverLetter(null, profile, job, matched);
         this.st.patchApplication(app.id, { coverLetter: text });
         return text;
       }
@@ -671,15 +824,13 @@ export class Pilot {
     await this.wait(420);
 
     if (result.answer === '__NEEDS_HUMAN__' || result.answer === 'Human review' || result.confidence < 0.55) {
-      const draft = result.answer && !/human review|__NEEDS_HUMAN__/i.test(result.answer) ? result.answer : undefined;
-      const value = await this.escalate(
-        app,
-        step,
-        question,
-        result.reason ?? 'Low confidence — the pilot will not guess on your behalf.',
-        { suggestion: draft, confidence: result.confidence },
-      );
-      return value;
+      // Only a real draft is offered as a suggestion; a placeholder never becomes an answer.
+      const draft =
+        result.answer && !/human review|__NEEDS_HUMAN__/i.test(result.answer) ? result.answer : undefined;
+      return this.escalate(app, step, question, result.reason ?? 'Low confidence — the pilot will not guess on your behalf.', {
+        suggestion: draft,
+        confidence: result.confidence,
+      });
     }
 
     this.st.patchStep(app.id, step.id, {
@@ -689,17 +840,9 @@ export class Pilot {
       confidence: result.confidence,
       detail: `${result.answer}${result.source === 'heuristic' ? ' (read straight off your resume)' : ` (drafted locally, ${Math.round(result.confidence * 100)}% conf)`}`,
     });
-    this.log(
-      'good',
-      `Answered without you (${Math.round(result.confidence * 100)}% conf): ${result.answer}`,
-      app.id,
-    );
+    this.log('good', `Answered without you (${Math.round(result.confidence * 100)}% conf): ${result.answer}`, app.id);
+    return result.answer;
   }
-}
-
-interface HumanReply {
-  value: string;
-  decision: 'answer' | 'skip' | 'timeout';
 }
 
 export const pilot = new Pilot();

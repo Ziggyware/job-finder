@@ -23,8 +23,10 @@ export interface Challenge {
   kind: ChallengeKind;
   prompt: string;
   solvableBy: 'agent' | 'ai' | 'human';
-  /** For 'ai' challenges: the expected token (the portal knows the answer). */
+  /** For 'ai' challenges: the expected token (the portal knows the answer). Never shown to the operator. */
   answer?: string;
+  /** Why this one is in front of the human, when that is not the default visual-wall reason. */
+  reason?: string;
   /** For 'human' challenges: validation is done in the UI against this. */
   humanAnswer?: string;
   /** Image tiles for select-image: each is a label the renderer draws. */
@@ -70,7 +72,7 @@ const HUMAN_ANSWERABLE: Challenge = {
     { glyph: '🚸', label: 'crosswalk', correct: true },
     { glyph: '🌁', label: 'bridge', correct: false },
     { glyph: '🚧', label: 'barrier', correct: false },
-    { glyph: '🦓', label: 'crosswalk', correct: true },
+    { glyph: '🦓', label: 'zebra crossing', correct: true },
     { glyph: '🚥', label: 'traffic light', correct: false },
     { glyph: '🚦', label: 'crosswalk sign', correct: true },
     { glyph: '🛑', label: 'stopsign', correct: false },
@@ -80,9 +82,20 @@ const HUMAN_ANSWERABLE: Challenge = {
 
 let counter = 0;
 
+/** Stable, well-mixed hash of an id, so each application draws its own challenges. */
+function hashId(id: string): number {
+  let h = 2166136261;
+  for (let i = 0; i < id.length; i++) {
+    h ^= id.charCodeAt(i);
+    h = Math.imul(h, 16777619);
+  }
+  return h >>> 0;
+}
+
 /** Produce the next challenge the fictional portal throws up. */
 export function nextChallenge(applicationId: string, ordinal: number): Challenge {
-  const pick = <T,>(arr: T[], seed: number) => arr[Math.abs(seed) % arr.length];
+  const pick = <T,>(arr: T[], seed: number) => arr[seed % arr.length];
+  const h = hashId(applicationId);
 
   if (ordinal === 0) {
     return {
@@ -93,7 +106,7 @@ export function nextChallenge(applicationId: string, ordinal: number): Challenge
   }
   // Second wall is usually a text CAPTCHA.
   if (ordinal === 1) {
-    const code = pick(TEXT_CAPTCHAS, applicationId.length + ordinal);
+    const code = pick(TEXT_CAPTCHAS, h + ordinal);
     return {
       kind: 'text-image',
       solvableBy: 'human',
@@ -103,7 +116,7 @@ export function nextChallenge(applicationId: string, ordinal: number): Challenge
   }
   // Then a text-reasoning challenge the local model can actually solve.
   if (ordinal === 2) {
-    return { ...pick(AI_CHALLENGES, applicationId.charCodeAt(1) + ordinal) };
+    return { ...pick(AI_CHALLENGES, h + ordinal) };
   }
   // Then something purely visual.
   if (ordinal === 3) return { ...HUMAN_ANSWERABLE };
@@ -137,16 +150,21 @@ export function makePendingChallenge(
     question: challenge.kind === 'question' ? challenge.prompt : undefined,
     expected: challenge.humanAnswer,
     tiles: challenge.tiles,
-    suggestion: challenge.answer,
+    // The portal's own expected answer (challenge.answer) is deliberately NOT
+    // surfaced as a draft: the operator should not be handed the key to a check.
     reason:
-      challenge.solvableBy === 'human'
+      challenge.reason ??
+      (challenge.solvableBy === 'human' && challenge.kind !== 'question'
         ? 'Visual anti-bot wall. A text-only model running in your tab cannot see images, so JobPilot stops and asks you rather than firing blind guesses at your account.'
-        : undefined,
+        : undefined),
     createdAt: Date.now(),
   };
 }
 
-/** Read the AI-solvable answer out of the local model, if it has one. */
+/**
+ * Ask the local model for the answer to an 'ai' challenge. Returns the raw reply;
+ * judging it is `answerMatches`' job, so a model reply is never trusted blindly.
+ */
 export async function solveChallengeWithAI(
   ask: (prompt: string) => Promise<string>,
   challenge: Challenge,
@@ -156,15 +174,32 @@ export async function solveChallengeWithAI(
     const reply = await ask(
       `Answer this anti-bot verification question with only the exact word or number, nothing else: "${challenge.prompt}"`,
     );
-    const cleaned = reply
-      .toLowerCase()
-      .replace(/[^a-z0-9 ]/g, ' ')
-      .trim()
-      .split(/\s+/)
-      .pop() ?? '';
-    if (!cleaned) return null;
-    return { answer: cleaned, confidence: 0.75 };
+    const answer = reply.trim();
+    if (!answer) return null;
+    return { answer, confidence: 0.75 };
   } catch {
     return null;
   }
+}
+
+const normaliseAnswer = (s: string) =>
+  s
+    .toLowerCase()
+    .replace(/[^a-z0-9 ]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+
+/**
+ * Does a model reply equal the expected answer? Exact after normalising case,
+ * punctuation and a leading filler ("The answer is", "a"). Substring tests are
+ * not acceptable here: "1" is not "10", "e" is not "motorcycle", and an empty
+ * expectation matches nothing.
+ */
+export function answerMatches(reply: string, expected: string): boolean {
+  const want = normaliseAnswer(expected);
+  if (!want) return false;
+  const got = normaliseAnswer(reply)
+    .replace(/^(the answer is|answer is|answer|it is|it s)\s+/, '')
+    .replace(/^(a|an|the)\s+/, '');
+  return got === want;
 }
