@@ -12,10 +12,9 @@ export default defineConfig({
     strictPort: false,
     allowedHosts: true,
     cors: true,
-    headers: {
-      'Cross-Origin-Opener-Policy': 'same-origin',
-      'Cross-Origin-Embedder-Policy': 'credentialless',
-    },
+    // No COOP/COEP here on purpose: WebLLM and pdf.js need no cross-origin
+    // isolation, and adding it would only restrict third-party fetches
+    // (model weights come from huggingface.co over plain CORS).
   },
   preview: {
     host: '0.0.0.0',

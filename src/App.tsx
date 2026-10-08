@@ -23,6 +23,12 @@ export default function App() {
   const engine = useStore((s) => s.engine);
   const phase = useStore((s) => s.phase);
   const pending = useStore((s) => s.pending);
+  const selectedJobIds = useStore((s) => s.selectedJobIds);
+  const criteria = useStore((s) => s.criteria);
+  const runnable = selectedJobIds.filter((id) => {
+    const m = matches.find((x) => x.jobId === id);
+    return !!m && m.score >= criteria.minScore;
+  }).length;
 
   // First run: show the model panel once a resume exists, so the download can
   // happen while the user reads the briefing.
@@ -140,8 +146,14 @@ export default function App() {
             ) : (
               <button
                 className="btn btn-primary"
-                disabled={!profile || !useStore.getState().selectedJobIds.length}
-                title={!profile ? 'Load a resume first' : 'Select postings in Briefing'}
+                disabled={!profile || runnable === 0}
+                title={
+                  !profile
+                    ? 'Load a resume first'
+                    : runnable === 0
+                      ? `Nothing selected above your minimum score of ${criteria.minScore} — pick postings in Briefing`
+                      : `Run ${Math.min(runnable, criteria.maxApplications)} application(s)`
+                }
                 onClick={() => {
                   const s = useStore.getState();
                   const queue = s.selectedJobIds
