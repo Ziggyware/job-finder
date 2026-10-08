@@ -165,7 +165,6 @@ export default function App() {
                     s.log('warn', 'Pick at least one posting above your minimum score before starting the pilot.');
                     return;
                   }
-                  s.resetRun();
                   setTab('run');
                   void pilot.run(ai.ready ? ai : null, queue as any, s.criteria, profile!);
                 }}

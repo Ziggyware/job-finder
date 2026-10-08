@@ -1,5 +1,5 @@
 import type { Job, JobMatch, ResumeProfile } from '../types';
-import { detectSkills, jobSkillKeys, profileSkillKeys } from './resume';
+import { detectSkills, escapeRegex, jobSkillKeys, profileSkillKeys } from './resume';
 
 // ---------------------------------------------------------------------------
 // Deterministic matching. Runs with zero AI available — the LLM only ever
@@ -20,19 +20,20 @@ export interface ScoreOptions {
 
 export function scoreJob(profile: ResumeProfile, job: Job): JobMatch {
   const have = profileSkillKeys(profile);
-  const requiredKeys = new Set(job.requiredSkills.flatMap(jobSkillKeys));
-  const niceKeys = new Set(job.niceToHave.flatMap(jobSkillKeys));
+
+  // A skill the vocabulary does not know cannot be matched by key, so fall back
+  // to the literal word appearing in the resume ("Prisma", "CUDA", "SOC 2").
+  const hasSkill = (skill: string) => {
+    if (jobSkillKeys(skill).some((k) => have.has(k))) return true;
+    if (detectSkills(skill).length) return false;
+    const word = new RegExp(`(?<![A-Za-z0-9])${escapeRegex(skill.trim())}(?![A-Za-z0-9])`, 'i');
+    return word.test(profile.rawText);
+  };
 
   const matchedRequired: string[] = [];
   const matchedNice: string[] = [];
-  for (const skill of job.requiredSkills) {
-    const keys = jobSkillKeys(skill);
-    if (keys.some((k) => have.has(k))) matchedRequired.push(skill);
-  }
-  for (const skill of job.niceToHave) {
-    const keys = jobSkillKeys(skill);
-    if (keys.some((k) => have.has(k))) matchedNice.push(skill);
-  }
+  for (const skill of job.requiredSkills) if (hasSkill(skill)) matchedRequired.push(skill);
+  for (const skill of job.niceToHave) if (hasSkill(skill)) matchedNice.push(skill);
 
   const missingRequired = job.requiredSkills.filter((s) => !matchedRequired.includes(s));
   const requiredCoverage = job.requiredSkills.length
@@ -67,19 +68,12 @@ export function scoreJob(profile: ResumeProfile, job: Job): JobMatch {
   // Recency: fresh postings get a nudge, ancient ones a nudge down.
   const recency = Math.max(0, 1 - job.postedDaysAgo / 30);
 
-  // Posting description wash: does the candidate's summary echo the language
-  // of the posting? (cheap proxy for "this is the same field")
-  const descKeys = new Set(detectSkills(job.description));
-  for (const k of have) descKeys.delete(k);
-  const fieldEcho = 1 - Math.min(descKeys.size / 8, 1);
-
   const score =
     requiredCoverage * 62 +
     niceCoverage * 13 +
     titleOverlap * 12 +
     seniorityFit * 8 +
-    recency * 5 +
-    fieldEcho * 0;
+    recency * 5;
 
   const pct = Math.max(3, Math.min(99, Math.round(score)));
 
@@ -87,7 +81,7 @@ export function scoreJob(profile: ResumeProfile, job: Job): JobMatch {
   // explicit requirement, no matter how good the rest is.
   const knockoutHit = (job.knockout ?? []).some((k) => {
     const keys = jobSkillKeys(k);
-    return !keys.some((key) => have.has(key)) && !new RegExp(k.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i').test(profile.rawText);
+    return !keys.some((key) => have.has(key)) && !new RegExp(escapeRegex(k), 'i').test(profile.rawText);
   });
 
   const verdict: JobMatch['verdict'] = knockoutHit
@@ -112,6 +106,7 @@ export function scoreJob(profile: ResumeProfile, job: Job): JobMatch {
     missingSkills: missingRequired,
     rationale,
     source: 'heuristic',
+    knockout: knockoutHit,
   };
 }
 
@@ -123,7 +118,8 @@ export function rankJobs(
   const { maxAgeDays = 0, threshold = 0, remoteOnly = false } = opts;
   return jobs
     .filter((j) => (maxAgeDays ? j.postedDaysAgo <= maxAgeDays : true))
-    .filter((j) => (remoteOnly ? j.remote !== 'onsite' : true))
+    // "Remote only" means remote: a hybrid role still needs office days, so it is not remote.
+    .filter((j) => (remoteOnly ? j.remote === 'remote' : true))
     .map((j) => scoreJob(profile, j))
     .filter((m) => m.score >= threshold)
     .sort((a, b) => b.score - a.score);

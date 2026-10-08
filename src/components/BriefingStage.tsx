@@ -51,7 +51,6 @@ export default function BriefingStage() {
       log('warn', 'Nothing selected above the minimum score — pick at least one posting to run.');
       return;
     }
-    useStore.getState().resetRun();
     void pilot.run(ai.ready ? ai : null, queue, criteria, profile);
   };
 

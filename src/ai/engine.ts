@@ -42,6 +42,9 @@ export class LocalAI {
   private mod: WebLLMModule | null = null;
   private tokensEmitted = 0;
   private generationStart = 0;
+  private loadChain: Promise<boolean> = Promise.resolve(true);
+  private worker: Worker | null = null;
+  private interruptRequested = false;
 
   onStatus(fn: StatusListener) {
     this.listeners.add(fn);
@@ -116,8 +119,20 @@ export class LocalAI {
     return out;
   }
 
-  /** Download + initialise a model. Safe to call repeatedly; reloads on model change. */
-  async load(modelId: string): Promise<boolean> {
+  /**
+   * Download + initialise a model. Safe to call repeatedly: loads and unloads are
+   * serialised on one chain, so overlapping calls (a double-click, or switching
+   * model while one is still downloading) can never leave two engines holding GPU memory.
+   */
+  load(modelId: string): Promise<boolean> {
+    const run = this.loadChain.then(() => this.doLoad(modelId));
+    this.loadChain = run.catch(() => false);
+    return run;
+  }
+
+  private async doLoad(modelId: string): Promise<boolean> {
+    if (this.handle?.modelId === modelId && this.ready) return true;
+
     let mod: WebLLMModule;
     try {
       mod = await this.module();
@@ -129,13 +144,13 @@ export class LocalAI {
       });
       return false;
     }
-    if (this.handle?.modelId === modelId && this.ready) return true;
 
     const probe = await this.probe();
     if (!probe.ok) return false;
 
-    this.ready = false;
-    this.handle = null;
+    // Release the previous model first, so its GPU memory is free before the new one allocates.
+    await this.releaseHandle();
+
     this.set({
       state: 'downloading',
       modelId,
@@ -156,19 +171,25 @@ export class LocalAI {
     };
 
     const config = { initProgressCallback: onProgress, logLevel: 'WARN' } as any;
+    let workerErr: unknown = null;
     try {
       let engine: any = null;
 
       // Preferred: a dedicated worker, so generation never blocks the UI.
       if (typeof Worker !== 'undefined') {
+        let worker: Worker | null = null;
         try {
-          const worker = new Worker(new URL('./model.worker.ts', import.meta.url), { type: 'module' });
+          worker = new Worker(new URL('./model.worker.ts', import.meta.url), { type: 'module' });
           engine = await mod.CreateWebWorkerMLCEngine(worker, modelId, config);
+          this.worker = worker;
           this.host = 'web-worker';
-        } catch (workerErr) {
-          console.warn('[jobpilot] worker engine unavailable, using the main thread', workerErr);
+        } catch (e) {
+          // A worker that failed to initialise must not be left running (it may hold GPU buffers).
+          worker?.terminate();
+          workerErr = e;
           engine = null;
           this.host = null;
+          console.warn('[jobpilot] worker engine unavailable, trying the main thread', e);
         }
       }
 
@@ -187,10 +208,12 @@ export class LocalAI {
       return true;
     } catch (e: any) {
       const msg = String(e?.message ?? e);
+      // The main-thread error is the one that matters (e.g. out of memory); keep the worker's too for diagnosis.
+      const detail = workerErr ? ` (worker attempt: ${String((workerErr as any)?.message ?? workerErr)})` : '';
       this.set({
         state: 'error',
-        error: msg,
-        progressText: `Could not load ${modelId}: ${msg}`,
+        error: msg + detail,
+        progressText: `Could not load ${modelId}: ${msg}${detail}`,
       });
       return false;
     }
@@ -198,6 +221,7 @@ export class LocalAI {
 
   /** Ask the model to stop generating (used when the operator hits stop). */
   interrupt() {
+    this.interruptRequested = true;
     try {
       const e: any = this.handle?.engine;
       if (typeof e?.interruptGenerate === 'function') e.interruptGenerate();
@@ -206,15 +230,31 @@ export class LocalAI {
     }
   }
 
-  unload() {
-    try {
-      this.handle?.engine?.unload?.();
-    } catch {
-      /* ignore */
-    }
+  /** Release the loaded model (serialised after any load in progress). */
+  unload(): void {
+    this.loadChain = this.loadChain.then(
+      () => this.releaseHandle().then(() => false),
+      () => this.releaseHandle().then(() => false),
+    );
+  }
+
+  /** Free the engine and its worker. Waits for an in-flight generation so GPU buffers are not pulled out from under it. */
+  private async releaseHandle(): Promise<void> {
+    if (!this.handle && !this.worker) return;
+    this.interrupt();
+    await this.queue.catch(() => undefined);
+    const engine = this.handle?.engine;
+    const worker = this.worker;
     this.handle = null;
+    this.worker = null;
     this.ready = false;
     this.host = null;
+    try {
+      await engine?.unload?.();
+    } catch {
+      /* already gone */
+    }
+    worker?.terminate();
     this.set({ state: 'idle', progress: 0, progressText: 'Model released.' });
   }
 
@@ -234,8 +274,12 @@ export class LocalAI {
     opts: { maxTokens?: number; temperature?: number; json?: boolean; seed?: number; onToken?: (t: string) => void } = {},
   ): Promise<string> {
     if (!this.handle) throw new Error('No model loaded');
+    const engine = this.handle.engine;
     return this.enqueue(async () => {
-      const { engine } = this.handle!;
+      if (!this.handle || this.handle.engine !== engine) {
+        throw new Error('The model was released before this request ran');
+      }
+      this.interruptRequested = false;
       this.tokensEmitted = 0;
       this.generationStart = performance.now();
       this.set({ state: 'generating' });
@@ -263,6 +307,9 @@ export class LocalAI {
             opts.onToken?.(acc);
           }
         }
+        // An interrupted reply is partial. Returning it as if complete would let a half-written
+        // answer or a truncated JSON object reach the operator or the form.
+        if (this.interruptRequested) throw new Error('Generation was interrupted');
         const secs = (performance.now() - this.generationStart) / 1000;
         if (secs > 0.5 && this.tokensEmitted > 4) {
           this.set({ tokensPerSec: +(this.tokensEmitted / secs).toFixed(1) });

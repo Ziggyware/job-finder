@@ -52,6 +52,8 @@ export interface JobMatch {
   rationale: string;
   /** Whether the model or the heuristic engine produced this. */
   source: 'ai' | 'heuristic';
+  /** The posting's hard knockout fired: the score is capped and must not be model-blended upward. */
+  knockout?: boolean;
 }
 
 export type StepKind =

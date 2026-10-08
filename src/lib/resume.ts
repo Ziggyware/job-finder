@@ -19,7 +19,7 @@ export const SKILL_ALIASES: Record<string, string[]> = {
   Go: ['golang', ' go '],
   Rust: ['rust'],
   'C++': ['c++', 'cpp'],
-  Java: ['java '],
+  Java: ['java'],
   'C#': ['c#', '.net'],
   Swift: ['swift', 'swiftui'],
   SwiftUI: ['swiftui'],
@@ -41,10 +41,10 @@ export const SKILL_ALIASES: Record<string, string[]> = {
     '60fps',
   ],
   GraphQL: ['graphql', 'apollo'],
-  'REST APIs': ['rest', 'rest api', 'restful', 'http api'],
-  'REST API': ['rest'],
+  'REST APIs': ['rest apis', 'rest api', 'restful', 'http api'],
+  'REST API': ['rest api', 'rest apis'],
   PostgreSQL: ['postgres', 'postgresql', 'psql'],
-  SQL: ['sql', 'queries'],
+  SQL: ['sql', 'mysql', 'mssql', 'queries'],
   Redis: ['redis'],
   Kafka: ['kafka', 'event streaming'],
   gRPC: ['grpc', 'protobuf'],
@@ -62,9 +62,9 @@ export const SKILL_ALIASES: Record<string, string[]> = {
   Embeddings: ['embeddings', 'vector search', 'vector database', 'faiss', 'pgvector', 'sentence transformers'],
   'Information Retrieval': ['information retrieval', 'search relevance', 'ranking', 'ranker', 'elasticsearch', 'opensearch'],
   'LLM fine-tuning': ['fine-tuning', 'finetuning', 'lora', 'peft', 'llm', 'large language model'],
-  ML: ['machine learning', 'ml ', 'deep learning', 'neural network'],
+  ML: ['machine learning', 'ml', 'deep learning', 'neural network'],
   Statistics: ['statistics', 'statistical', 'regression', 'hypothesis test'],
-  'A/B Testing': ['a/b test', 'ab test', 'experimentation', 'experiment design'],
+  'A/B Testing': ['a/b test', 'a/b testing', 'ab test', 'ab testing', 'experimentation', 'experiment design'],
   dbt: ['dbt'],
   Snowflake: ['snowflake', 'bigquery', 'warehouse'],
   Looker: ['looker', 'tableau', 'superset', 'metabase'],
@@ -75,7 +75,7 @@ export const SKILL_ALIASES: Record<string, string[]> = {
   Testing: ['testing', 'unit test', 'test suite', 'jest', 'vitest', 'pytest', 'tdd'],
   'Test Design': ['test plan', 'test strategy', 'qa'],
   Accessibility: ['accessibility', 'a11y', 'wcag', 'screen reader', 'aria'],
-  'Design Systems': ['design system', 'component library', 'storybook'],
+  'Design Systems': ['design system', 'component library', 'storybook', 'design tokens'],
   CSS: ['css', 'sass', 'scss', 'tailwind', 'styled-components'],
   HTML: ['html', 'html5', 'semantic markup'],
   Figma: ['figma', 'sketch', 'adobe xd'],
@@ -115,10 +115,31 @@ export const SKILL_ALIASES: Record<string, string[]> = {
   'Core Data': ['core data', 'coredata', 'realm', 'sqlite'],
   'Unit Testing': ['unit testing', 'xctest'],
   Motion: ['animation', 'motion design', 'framer motion', 'gsap'],
-  'Design Systems ': ['design tokens'],
 };
 
-const ALL_SKILL_KEYS = Object.keys(SKILL_ALIASES);
+const REGEX_SPECIAL = '.*+?^${}()|[]\\';
+/** Escape a literal string for use inside a RegExp. */
+export const escapeRegex = (s: string) =>
+  Array.from(s, (c) => (REGEX_SPECIAL.includes(c) ? `\\${c}` : c)).join('');
+
+/**
+ * One regex per alias, anchored on word edges. A bare substring test would
+ * read "requirements" as TypeScript ("ts"), "digital" as Git, "restaurants"
+ * as REST, and "ratios" as iOS. Letters are the boundary; digits are not, so
+ * "python3" and "s3" still resolve.
+ */
+function aliasRegex(alias: string): RegExp {
+  const lower = alias.toLowerCase();
+  const pre = /^[a-z]/.test(lower) ? '(?<![a-z])' : '';
+  // Allow a plural ("design systems", "unit tests") but nothing longer.
+  const post = /[a-z]$/.test(lower) ? '(?:e?s)?(?![a-z])' : '';
+  return new RegExp(pre + escapeRegex(lower) + post);
+}
+
+const COMPILED_ALIASES = Object.keys(SKILL_ALIASES).map((key) => ({
+  key: key.trim(),
+  patterns: SKILL_ALIASES[key].map(aliasRegex),
+}));
 
 function normalise(text: string) {
   return ` ${text.toLowerCase().replace(/[\u2018\u2019]/g, "'").replace(/\s+/g, ' ')} `;
@@ -128,14 +149,8 @@ function normalise(text: string) {
 export function detectSkills(text: string): string[] {
   const hay = normalise(text);
   const found = new Set<string>();
-  for (const key of ALL_SKILL_KEYS) {
-    const aliases = SKILL_ALIASES[key];
-    for (const alias of aliases) {
-      if (hay.includes(alias.toLowerCase())) {
-        found.add(key.trim());
-        break;
-      }
-    }
+  for (const { key, patterns } of COMPILED_ALIASES) {
+    if (patterns.some((re) => re.test(hay))) found.add(key);
   }
   return [...found];
 }
@@ -180,10 +195,15 @@ const LOCATION_RE =
 const EMAIL_RE = /[\w.+-]+@[\w-]+\.[\w.]{2,}/;
 const PHONE_RE =
   /(?:\+?\d{1,3}[\s.-]?)?\(?\d{3}\)?[\s.-]?\d{3}[\s.-]?\d{4}\b|\+\d{2}[\s.-]?\d{2,4}[\s.-]?\d{3,4}[\s.-]?\d{3,4}/;
-const URL_RE = /(?:https?:\/\/)?(?:www\.)?(?:github\.com|gitlab\.com|linkedin\.com|[\w-]+\.(?:dev|io|com|me|net|org))\/?[\w./#-]*/gi;
+const URL_RE = /(?<![@\w.-])(?:https?:\/\/)?(?:www\.)?(?:github\.com|gitlab\.com|linkedin\.com|[\w-]+\.(?:dev|io|com|me|net|org))\/?[\w./#-]*/gi;
 
 const DEGREE_RE =
   /\b(B\.?\s?S\.?|B\.?\s?A\.?|B\.?\s?E\.?|Bachelor(?:'s)?(?: of [A-Za-z ]+)?|M\.?\s?S\.?|M\.?\s?A\.?|Master(?:'s)?(?: of [A-Za-z ]+)?|Ph\.?\s?D\.?|Doctorate|MBA|Associate(?:'s)?)\b[^\n]{0,90}/gi;
+
+const SPAN_RE = /((?:19|20)\d{2})\s*(?:-|–|—|to)\s*((?:19|20)\d{2}|present|current|now)/gi;
+// Degree-specific tokens only: "Associate Engineer" or "Master Data Engineer" are job titles, not degrees.
+const EDUCATION_RE =
+  /(?<![a-z])(university|college|institute|bachelor'?s?|master'?s|mba|ph\.?\s?d|diploma|degree|b\.?s\.?|b\.?a\.?|m\.?s\.?)(?![a-z])/i;
 
 function guessYearsExperience(text: string): number {
   // 1. Explicit statements: "8+ years of experience", "over 6 years"
@@ -195,24 +215,36 @@ function guessYearsExperience(text: string): number {
     const years = Math.max(...explicit.map((m) => parseInt(m[1], 10)));
     if (years > 0 && years < 45) return years;
   }
-  // 2. Sum spans of "2019 - 2023" / "Jan 2019 – Present"
-  const spans = [...text.matchAll(/((?:19|20)\d{2})\s*(?:-|–|—|to)\s*((?:19|20)\d{2}|present|current|now)/gi)];
+  // 2. Dated role spans. Overlapping roles must not be double-counted, and a
+  //    degree's dates ("2010 - 2014, University of …") are not work experience.
   const now = new Date().getFullYear();
-  let total = 0;
-  const seen = new Set<string>();
-  for (const [, a, b] of spans) {
-    const start = parseInt(a, 10);
-    const end = /present|current|now/i.test(b) ? now : parseInt(b, 10);
-    const key = `${start}-${end}`;
-    if (seen.has(key) || end < start || end - start > 40) continue;
-    if (start < 1985 || start > now + 1) continue;
-    seen.add(key);
-    total += end - start;
+  const intervals: [number, number][] = [];
+  for (const line of text.split('\n')) {
+    if (EDUCATION_RE.test(line)) continue;
+    for (const [, a, b] of line.matchAll(SPAN_RE)) {
+      const start = parseInt(a, 10);
+      const end = /present|current|now/i.test(b) ? now : parseInt(b, 10);
+      if (end < start || end - start > 40) continue;
+      if (start < 1985 || start > now + 1) continue;
+      intervals.push([start, end]);
+    }
   }
+  intervals.sort((x, y) => x[0] - y[0]);
+  let total = 0;
+  let current: [number, number] | null = null;
+  for (const [start, end] of intervals) {
+    if (!current || start > current[1]) {
+      if (current) total += current[1] - current[0];
+      current = [start, end];
+    } else {
+      current[1] = Math.max(current[1], end);
+    }
+  }
+  if (current) total += current[1] - current[0];
   if (total > 0) return Math.min(45, Math.round(total));
   // 3. Seniorsity words as a last resort
   if (/\b(principal|staff|head of|director)\b/i.test(text)) return 12;
-  if (/\bsenior|sr\.?\b/i.test(text)) return 7;
+  if (/\bsenior\b|\bsr\./i.test(text)) return 7;
   if (/\bjunior|intern|entry[- ]level|graduate\b/i.test(text)) return 1;
   return 4;
 }
@@ -262,7 +294,6 @@ export function profileResume(rawText: string): ResumeProfile {
   const phone = text.match(PHONE_RE)?.[0]?.trim() ?? '';
   const location = text.match(LOCATION_RE)?.[1] ?? '';
   const links = [...new Set((text.match(URL_RE) ?? []).map((u) => u.replace(/[),.]$/, '')))]
-    .filter((u) => !u.includes('@'))
     .slice(0, 5);
 
   // Name: first non-empty line that looks like a person's name and is not

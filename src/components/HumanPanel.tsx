@@ -42,9 +42,15 @@ function TaskCard({ task }: { task: PendingTask }) {
   const [error, setError] = useState<string | null>(null);
   const [solved, setSolved] = useState(false);
 
+  const checkboxTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  useEffect(() => () => {
+    if (checkboxTimer.current !== null) clearTimeout(checkboxTimer.current);
+  }, []);
+
   const answer = (v: string) => {
-    setSolved(true);
+    // Send first: the pilot clears the task from the queue, so the card goes with it.
     pilot.answerPending(task.id, v);
+    setSolved(true);
   };
 
   useEffect(() => {
@@ -171,7 +177,8 @@ function TaskCard({ task }: { task: PendingTask }) {
               type="checkbox"
               className="h-4 w-4 accent-[var(--color-you)]"
               onChange={(e) => {
-                if (e.target.checked) setTimeout(() => answer('checked'), 350);
+                if (!e.target.checked || checkboxTimer.current !== null) return;
+                checkboxTimer.current = setTimeout(() => answer('checked'), 350);
               }}
             />
             <span className="text-xs">I am not a robot</span>
@@ -358,12 +365,17 @@ function DragPuzzle({ onSubmit }: { onSubmit: (v: string) => void }) {
   const [solved, setSolved] = useState(false);
   const target = useRef(0.55 + Math.random() * 0.3);
   const gapLeft = target.current * 100;
+  // Refs, not state, for the values the release handler needs: they are always current,
+  // and the submit cannot fire twice.
+  const posRef = useRef(0.08);
+  const doneRef = useRef(false);
 
   const onMove = (clientX: number) => {
     const el = trackRef.current;
-    if (!el || solved) return;
+    if (!el || doneRef.current) return;
     const rect = el.getBoundingClientRect();
     const ratio = Math.min(1, Math.max(0, (clientX - rect.left) / rect.width));
+    posRef.current = ratio;
     setPos(ratio);
   };
 
@@ -372,14 +384,17 @@ function DragPuzzle({ onSubmit }: { onSubmit: (v: string) => void }) {
     const move = (e: PointerEvent) => onMove(e.clientX);
     const up = () => {
       setDragging(false);
-      setPos((p) => {
-        if (Math.abs(p - target.current) < 0.055) {
-          setSolved(true);
-          onSubmit('puzzle solved');
-          return target.current;
-        }
-        return 0.08;
-      });
+      if (doneRef.current) return;
+      if (Math.abs(posRef.current - target.current) < 0.055) {
+        doneRef.current = true;
+        posRef.current = target.current;
+        setSolved(true);
+        setPos(target.current);
+        onSubmit('puzzle solved');
+      } else {
+        posRef.current = 0.08;
+        setPos(0.08);
+      }
     };
     window.addEventListener('pointermove', move);
     window.addEventListener('pointerup', up);
@@ -387,6 +402,7 @@ function DragPuzzle({ onSubmit }: { onSubmit: (v: string) => void }) {
       window.removeEventListener('pointermove', move);
       window.removeEventListener('pointerup', up);
     };
+    // onMove only reads refs, so it does not need to be a dependency.
   }, [dragging, onSubmit]);
 
   return (

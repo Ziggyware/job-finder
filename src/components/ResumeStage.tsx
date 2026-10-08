@@ -53,6 +53,9 @@ export default function ResumeStage() {
   const setMatches = useStore((s) => s.setMatches);
   const log = useStore((s) => s.log);
   const engine = useStore((s) => s.engine);
+  const phase = useStore((s) => s.phase);
+  // A run holds its own copy of the profile; swapping the resume under it would leave the UI lying about what it used.
+  const runActive = phase === 'running' || phase === 'paused';
 
   const [drag, setDrag] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -61,9 +64,13 @@ export default function ResumeStage() {
   const [pasteText, setPasteText] = useState('');
   const [tab, setTab] = useState<'profile' | 'raw'>('profile');
   const inputRef = useRef<HTMLInputElement>(null);
+  // Each ingest takes a ticket; a slower, older parse must not overwrite a newer resume when it finishes late.
+  const ingestSeq = useRef(0);
 
   const ingest = useCallback(
     async (text: string, filename: string, warn: string[] = []) => {
+      const ticket = ++ingestSeq.current;
+      const current = () => ticket === ingestSeq.current;
       setError(null);
       setWarnings(warn);
       const parsed = profileResume(text);
@@ -71,20 +78,19 @@ export default function ResumeStage() {
         setError('That did not yield enough text to work with. Try pasting the resume text instead.');
         return;
       }
+      // Set the profile and the ranking before anything awaits, so the Briefing never shows the previous resume's matches.
       setProfile(parsed, filename);
-      log(
-        'info',
-        `Resume ingested on this device: ${filename} → ${parsed.skills.length} skills recognised, ${parsed.yearsExperience} years of experience inferred.`,
-      );
-      const summary = await summarizeProfile(ai.ready ? ai : null, parsed);
-      setAiSummary(summary);
-      // Rank immediately — heuristics need no model.
+      setAiSummary('');
       const criteria = useStore.getState().criteria;
       const matches = rankJobs(parsed, JOBS, {
         maxAgeDays: criteria.maxAgeDays,
         remoteOnly: criteria.remoteOnly,
       });
       setMatches(matches);
+      log(
+        'info',
+        `Resume ingested on this device: ${filename} → ${parsed.skills.length} skills recognised, ${parsed.yearsExperience} years of experience inferred.`,
+      );
       log('good', `Ranked ${matches.length} postings against the resume. Top match: ${matches[0]?.score ?? 0}/100.`);
       if (ai.ready) {
         log('ai', 'Local model produced a candidate summary without any network call.');
@@ -94,14 +100,16 @@ export default function ResumeStage() {
           'No local model loaded — ranking with rule-based evidence scoring and template drafts. Open the model panel to run an open-weight model on your GPU for AI-written cover letters and answers.',
         );
       }
+      // The summary is the only slow part, and it is cosmetic: it arrives last and only if still current.
+      const summary = await summarizeProfile(ai.ready ? ai : null, parsed);
+      if (current()) setAiSummary(summary);
     },
     [ai, log, setAiSummary, setMatches, setProfile],
   );
 
   const onFiles = useCallback(
-    async (files: FileList | null) => {
-      const file = files?.[0];
-      if (!file) return;
+    async (file: File | undefined) => {
+      if (!file || runActive) return;
       setBusy(true);
       setError(null);
       try {
@@ -113,7 +121,7 @@ export default function ResumeStage() {
         setBusy(false);
       }
     },
-    [ingest, setBusy],
+    [ingest, setBusy, runActive],
   );
 
   return (
@@ -137,7 +145,7 @@ export default function ResumeStage() {
             onDrop={(e) => {
               e.preventDefault();
               setDrag(false);
-              void onFiles(e.dataTransfer.files);
+              void onFiles(e.dataTransfer.files[0]);
             }}
             onClick={() => inputRef.current?.click()}
             className={cx(
@@ -152,7 +160,12 @@ export default function ResumeStage() {
               type="file"
               accept=".pdf,.docx,.txt,.md,.rtf,application/pdf"
               className="hidden"
-              onChange={(e) => void onFiles(e.target.files)}
+              onChange={(e) => {
+                // Read the file, then clear the input: otherwise picking the same file again fires no change event.
+                const file = e.target.files?.[0];
+                e.target.value = '';
+                void onFiles(file);
+              }}
             />
             <div className="mb-3 text-3xl">{busy ? '⏳' : '📄'}</div>
             <div className="text-sm font-medium">
@@ -323,7 +336,10 @@ export default function ResumeStage() {
             </div>
             <button
               className="btn btn-ghost mt-4 w-full"
+              disabled={runActive}
+              title={runActive ? 'Stop the run before loading a different resume.' : undefined}
               onClick={() => {
+                if (runActive) return;
                 setProfile(null, null);
                 setAiSummary('');
                 setMatches([]);

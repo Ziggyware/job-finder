@@ -49,6 +49,27 @@ function jobBlock(job: Job) {
   ].join('\n');
 }
 
+const SIGNOFF_WORDS =
+  /^(sincerely|best regards|best|regards|kind regards|warm regards|with thanks|thank you|thanks|yours (?:truly|sincerely|faithfully))\b/i;
+
+/**
+ * Remove a closing sign-off and any signature name from the end of a letter.
+ * Only a sign-off line followed by at most a few capitalised name words counts,
+ * so "Best practices…" or "Thanks for your time." inside the body survive.
+ */
+export function stripSignOff(text: string): string {
+  const lines = text.split('\n');
+  for (let i = lines.length - 1; i >= Math.max(0, lines.length - 4); i--) {
+    const m = lines[i].trim().match(SIGNOFF_WORDS);
+    if (!m) continue;
+    const rest = lines[i].trim().slice(m[0].length);
+    if (/^[ ,.!]*(?:[A-Z][\w'.-]*\s*){0,4}$/.test(rest)) {
+      return lines.slice(0, i).join('\n').trim();
+    }
+  }
+  return text.trim();
+}
+
 /** 2–3 sentence cover letter. Falls back to a template built from the profile. */
 export async function draftCoverLetter(
   ai: LocalAI | null,
@@ -80,12 +101,61 @@ export async function draftCoverLetter(
       ],
       { maxTokens: 260, temperature: 0.5 },
     );
-    const cleaned = text.replace(/^(cover letter|dear[^\n]*)\s*:?\s*/i, '').replace(/^(sincerely|best|regards)[\s\S]*$/i, '').trim();
+    const cleaned = stripSignOff(text.replace(/^(cover letter|dear[^\n]*)\s*:?\s*/i, '').trim());
     if (cleaned.length > 60) return cleaned;
     return fallback();
   } catch {
     return fallback();
   }
+}
+
+/**
+ * Topics a language model must never answer unattended. Shared by the pilot and
+ * by answerQuestion, and checked before any heuristic so a broad keyword can
+ * never answer one of these for the candidate.
+ */
+export const SENSITIVE_TOPICS: { id: string; label: string; re: RegExp; reason: string }[] = [
+  {
+    id: 'work-authorisation',
+    label: 'work authorisation',
+    re: /\b(work authori[sz]ation|authori[sz]ed to work|legally (?:authori[sz]ed|eligible|permitted)|right to work|eligible to work|work permits?|work visas?|visa|visa sponsorship|sponsorship|sponsor)\b/i,
+    reason: 'Work authorisation is a legal declaration. JobPilot never answers this for you — it must come from you.',
+  },
+  {
+    id: 'compensation',
+    label: 'compensation expectations',
+    re: /\b(salary|salaries|compensation|remuneration|wages?|ctc|pay (?:expectations?|rate|range|requirements?)|expected pay|desired pay|hourly rate|day rate|rate expectations?|expected rate)\b/i,
+    reason: 'Compensation expectations are a negotiating position, not a fact on the resume. Your call.',
+  },
+  {
+    id: 'availability',
+    label: 'notice period and availability',
+    re: /\b(notice period|start date|available to start|earliest start|when can you start|availability)\b/i,
+    reason: 'Only you know your actual availability. The pilot will not invent a start date.',
+  },
+  {
+    id: 'credentials',
+    label: 'credentials and clearances',
+    re: /\b(clearance|security clearance|certifications?|certified|licen[cs]es?|credentials?)\b/i,
+    reason: 'Credentials must be asserted by the candidate, not inferred.',
+  },
+  {
+    id: 'eeo',
+    label: 'equal-opportunity and self-identification questions',
+    re: /\b(gender|race|ethnicity|ethnic|veterans?|disability|disabilities|disabled|sexual orientation|pronouns?|religion|religious|demographics?|equal opportunity|eeo)\b/i,
+    reason: 'Equal-opportunity and self-identification questions are voluntary and personal. Only you answer them.',
+  },
+  {
+    id: 'background',
+    label: 'criminal-record and background questions',
+    re: /\b(criminal|convicted|convictions?|felony|felonies|arrests?|background checks?|pending charges)\b/i,
+    reason: 'Criminal-record and background questions are personal legal disclosures. Only you answer them.',
+  },
+];
+
+/** The sensitive topic a question touches, if any. */
+export function sensitiveTopic(question: string) {
+  return SENSITIVE_TOPICS.find((t) => t.re.test(question)) ?? null;
 }
 
 /** Answer one application question. Low confidence ⇒ the human gets asked. */
@@ -95,53 +165,34 @@ export async function answerQuestion(
   job: Job,
   question: string,
 ): Promise<AnswerResult> {
+  // Sensitive topics come first: no heuristic or model may answer them.
+  const sensitive = sensitiveTopic(question);
+  if (sensitive) {
+    return {
+      answer: '__NEEDS_HUMAN__',
+      confidence: sensitive.id === 'availability' ? 0.3 : 0.2,
+      source: 'heuristic',
+      reason: sensitive.reason,
+    };
+  }
+
   const q = question.toLowerCase();
 
-  // Facts that must never be guessed by a language model.
-  if (/(e-?mail)/.test(q) && profile.email)
+  // Facts that can be read straight off the resume.
+  if (/\b(e-?mail)\b/.test(q) && profile.email)
     return { answer: profile.email, confidence: 0.99, source: 'heuristic' };
-  if (/(phone|mobile|contact number)/.test(q) && profile.phone)
+  if (/\b(phone|mobile|contact number)\b/.test(q) && profile.phone)
     return { answer: profile.phone, confidence: 0.99, source: 'heuristic' };
-  if (/(full name|your name)/.test(q))
+  if (/\b(full name|your name)\b/.test(q))
     return { answer: profile.name, confidence: 0.98, source: 'heuristic' };
-  if (/(city|location|where are you based|time ?zone)/.test(q) && profile.location)
+  if (/\b(city|location|where are you based|time ?zone)\b/.test(q) && profile.location)
     return { answer: profile.location, confidence: 0.9, source: 'heuristic' };
-  if (/(years? of|how many years)/.test(q) && /experience/.test(q))
+  if (/\b(years? of|how many years)\b/.test(q) && /\bexperience\b/.test(q))
     return {
       answer: String(profile.yearsExperience),
       confidence: 0.85,
       source: 'heuristic',
       reason: 'summed from dated roles on the resume',
-    };
-  if (/(authoris|authoriz|legally.*work|work.*permit|visa|sponsor)/.test(q))
-    return {
-      answer: '__NEEDS_HUMAN__',
-      confidence: 0.2,
-      source: 'heuristic',
-      reason:
-        'Work authorisation is a legal declaration. JobPilot never answers this for you — it must come from you.',
-    };
-  if (/(salary|compensation|rate|expect)/.test(q))
-    return {
-      answer: '__NEEDS_HUMAN__',
-      confidence: 0.25,
-      source: 'heuristic',
-      reason:
-        'Compensation expectations are a negotiating position, not a fact on the resume. Your call.',
-    };
-  if (/(notice period|start date|available to start)/.test(q))
-    return {
-      answer: '__NEEDS_HUMAN__',
-      confidence: 0.3,
-      source: 'heuristic',
-      reason: 'Only you know your actual availability. The pilot will not invent a start date.',
-    };
-  if (/(clearance|certification|certified|licen[cs]e|security clear)/.test(q))
-    return {
-      answer: '__NEEDS_HUMAN__',
-      confidence: 0.15,
-      source: 'heuristic',
-      reason: 'Credentials must be asserted by the candidate, not inferred.',
     };
 
   if (!ai?.ready) {
@@ -186,15 +237,6 @@ export async function answerQuestion(
           reason: out.basis?.trim() || 'The local model judged this too sensitive to answer unattended.',
         };
       }
-      if (/(salary|compensation|sponsor|clearance|visa|authoris|authoriz)/i.test(question)) {
-        // Belt and braces: even a confident model answer on these gets a human.
-        return {
-          answer,
-          confidence: Math.min(confidence, 0.45),
-          source: 'ai',
-          reason: 'Sensitive topic — drafted by the pilot, but you confirm it.',
-        };
-      }
       return { answer, confidence, source: 'ai', reason: out.basis?.trim() };
     }
   } catch {
@@ -232,10 +274,13 @@ export async function refineMatch(
       { maxTokens: 220, temperature: 0.2 },
     );
     if (!out || typeof out.score !== 'number') return heuristic;
+    // A knockout (hard requirement missing) keeps the heuristic's capped score.
+    // Everywhere else the model's view is blended in, whatever the verdict.
     const blended = Math.round(out.score * 0.45 + heuristic.score * 0.55);
+    const score = heuristic.knockout ? heuristic.score : blended;
     return {
       ...heuristic,
-      score: Math.max(3, Math.min(99, heuristic.verdict === 'stretch' && heuristic.score < 35 ? heuristic.score : blended)),
+      score: Math.max(3, Math.min(99, score)),
       rationale: out.rationale?.trim() ? `${out.rationale.trim()} (Pilot score ${Math.round(out.score)} blended with evidence score ${heuristic.score}.)` : heuristic.rationale,
       missingSkills: Array.isArray(out.missing) && out.missing.length ? out.missing.slice(0, 6).map(String) : heuristic.missingSkills,
       source: 'ai',

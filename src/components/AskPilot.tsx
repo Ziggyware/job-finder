@@ -2,6 +2,8 @@ import { useEffect, useMemo, useRef, useState } from 'react';
 import { useStore } from '../store';
 import { ai } from '../ai/instance';
 import { cx, scrollToBottom, truncate } from '../lib/util';
+import { jobsById } from '../data/jobs';
+import { SENSITIVE_TOPICS } from '../ai/tasks';
 
 interface Msg {
   role: 'user' | 'assistant';
@@ -234,24 +236,26 @@ function heuristicAnswer(q: string, snapshot: string): string {
   const failed = s.applications.filter((a) => a.status === 'failed');
   const lower = q.toLowerCase();
 
-  if (/how many|count|submitted|went out|sent/.test(lower)) {
+  if (/\b(how many|count|submitted|went out|sent)\b/.test(lower)) {
     return `${submitted.length} submitted so far${failed.length ? `, ${failed.length} deliberately not sent` : ''}. ${submitted.length ? `Receipts: ${submitted.map((a) => `${a.job.company} ${a.confirmationId}`).join(', ')}.` : ''}`;
   }
-  if (/waiting|needs me|blocked|pending|human/.test(lower)) {
+  if (/\b(waiting|needs me|blocked|pending|human)\b/.test(lower)) {
     if (!blocked.length && !s.pending.length) return 'Nothing is waiting on you right now.';
     return `${s.pending.length} item(s) are parked for you: ${s.pending.map((p) => `${p.company} — ${p.question ?? p.challengePrompt}`).join(' | ')}`;
   }
-  if (/weakest|worst|lowest|best|strongest|fit/.test(lower)) {
+  if (/\b(weakest|worst|lowest|best|strongest|fit)\b/.test(lower)) {
     const ranked = [...s.matches].sort((a, b) => b.score - a.score);
     if (!ranked.length) return 'No postings have been ranked yet — load a resume first.';
     const low = ranked[ranked.length - 1];
-    const job = s.applications.find((a) => a.jobId === low.jobId)?.job;
-    return `Weakest fit in the queue is ${job?.title ?? low.jobId} at ${job?.company ?? 'unknown'} (${low.score}/100): ${truncate(low.rationale, 220)}`;
+    // Look the posting up in the full catalogue: an unqueued posting is still a valid answer.
+    const job = jobsById.get(low.jobId);
+    return `Weakest fit in the queue is ${job?.title ?? low.jobId} at ${job?.company ?? 'an unknown company'} (${low.score}/100): ${truncate(low.rationale, 220)}`;
   }
-  if (/refuse|decline|not answer|sensitive|captcha|human check/.test(lower)) {
-    return 'The pilot refuses four things: work authorisation, notice/availability, salary expectations, and any credential or clearance claim. Visual anti-bot walls also come to you, because a text model in a browser tab cannot see images.';
+  if (/\b(refuse|refused|decline|not answer|sensitive|captcha|human check)\b/.test(lower)) {
+    const topics = SENSITIVE_TOPICS.map((t) => t.label).join('; ');
+    return `The pilot never answers these itself: ${topics}. Each goes to you as a plain question. Visual anti-bot walls also come to you, because a text model in a browser tab cannot see images.`;
   }
-  if (/model|ai|free|cost|api/.test(lower)) {
+  if (/\b(model|models|ai|free|cost|costs|api)\b/.test(lower)) {
     return `No model is loaded, so I am answering from the run state directly. Loading one costs nothing beyond the one-time download — it runs on your GPU via WebGPU with no API key. Current engine state: ${s.engine.state}.`;
   }
   return `I can answer from the run state without a model (counts, receipts, what is blocked, which fit is weakest). For free-form questions, load a local model in the model panel — it runs on your GPU, no key needed. Snapshot length: ${snapshot.length} characters.`;
